@@ -1,0 +1,16 @@
+{
+    "name": "provider_dao_router",
+    "description": "",
+    "image": "",
+    "properties": {
+        "package_name": "provider_dao_router",
+        "current_version": "0.1.0",
+        "publisher": "nick1udwig.os",
+        "mirrors": [],
+        "code_hashes": {
+            "0.1.0": ""
+        }
+    },
+    "external_url": "",
+    "animation_url": ""
+}
