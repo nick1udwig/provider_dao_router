@@ -246,6 +246,7 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("fetch_chain_state got wrong Response back"));
     };
     state.on_chain_state = new_dao_state.clone();
+    state.save()?;
     Ok(())
 }
 
@@ -267,6 +268,7 @@ fn serve_job(
          .inherit(true)
          .expects_response(60)  // TODO
          .send()?;
+    state.save()?;
     Ok(())
 }
 
@@ -283,6 +285,7 @@ fn handle_admin_request(
         AdminRequest::SetProviderProcess { process_id } => {
             let process_id = process_id.parse()?;
             state.provider_process = Some(process_id);
+            state.save()?;
             Response::new()
                 .body(serde_json::to_vec(&AdminResponse::SetProviderProcess { err: None })?)
                 .send()?;
@@ -290,9 +293,7 @@ fn handle_admin_request(
         AdminRequest::SetRollupSequencer { address } => {
             let address = address.parse()?;
             state.rollup_sequencer = Some(address);
-            println!("{:?}", state.on_chain_state);
             await_chain_state(state)?;
-            println!("{:?}", state.on_chain_state);
             Response::new()
                 .body(serde_json::to_vec(&AdminResponse::SetRollupSequencer { err: None })?)
                 .send()?;
@@ -315,14 +316,14 @@ fn handle_public_request(
                 let address = Address::new(member.clone(), process_id.clone());
                 match Request::to(address.clone())
                     .body(serde_json::to_vec(&MemberRequest::QueryReady)?)
-                    .send_and_await_response(  // TODO: can't await
+                    .send_and_await_response(  // TODO: can't await; this blocks and so is unsuitable for a router, which should never block; need to have a better algo here for querying ready / starting jobs
                         state.on_chain_state.queue_response_timeout_seconds as u64
                     )?
                 {
                     Ok(m) => {
+                        state.ready_providers.remove(&member);
                         let MemberResponse::QueryReady { is_ready } = serde_json::from_slice(m.body())? else {
                             // unexpected Response
-                            state.ready_providers.remove(&member);
                             continue;
                         };
                         if !is_ready {
@@ -336,7 +337,6 @@ fn handle_public_request(
                         // TODO: reprimand offline member?
                     }
                 }
-                state.ready_providers.remove(&member);
             }
             // no one available to serve job
             // TODO: add stat trackers so we can expose endpoints:
@@ -344,6 +344,8 @@ fn handle_public_request(
             //  * average time / job
             //    -> expected time till result
             state.job_queue.push_back(job);
+            println!("no ready providers; queued; now have {} queued", state.job_queue.len());
+            state.save()?;
         }
     }
     Ok(())
@@ -369,6 +371,7 @@ fn handle_member_request(
                     serve_job(source.clone(), job, state)?;
                 } else {
                     state.ready_providers.insert(source.node().to_string());
+                    state.save()?;
                 }
             }
         }
@@ -395,6 +398,7 @@ fn handle_member_response(
                 .inherit(true)
                 .send()?;
             state.outstanding_jobs.remove(message.source().node());
+            state.save()?;
         }
         MemberResponse::SetIsReady | MemberResponse::QueryReady { .. } => {
             return Err(anyhow::anyhow!("unexpected MemberResponse"));
@@ -411,6 +415,7 @@ fn handle_sequencer_response(state: &mut FullDaoState) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("fetch_chain_state got wrong Response back"));
     };
     state.on_chain_state = new_dao_state.clone();
+    state.save()?;
     Ok(())
 }
 
