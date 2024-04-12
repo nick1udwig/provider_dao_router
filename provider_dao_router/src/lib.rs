@@ -18,9 +18,7 @@ wit_bindgen::generate!({
 
 #[derive(Debug, Serialize, Deserialize)]
 enum PublicRequest {
-    /// Start a job.
-    /// Parameters in LazyLoadBlob.
-    RunJob { workflow: String, prompt: String },
+    RunJob(JobParameters),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +77,12 @@ enum SequencerResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobParameters {
+    pub workflow: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ReadRequest {
     All,
     Dao,
@@ -105,6 +109,7 @@ struct FullDaoState {
     on_chain_state: OnChainDaoState,
     ready_providers: HashSet<String>,
     outstanding_jobs: HashMap<String, u64>,
+    job_queue: std::collections::VecDeque<JobParameters>,
     rng: Pcg64,
     // TODO: payments
     // client_outstanding_payments: HashMap<String, u8>,
@@ -166,6 +171,7 @@ impl Default for FullDaoState {
             on_chain_state: OnChainDaoState::default(),
             ready_providers: HashSet::new(),
             outstanding_jobs: HashMap::new(),
+            job_queue: std::collections::VecDeque::new(),
             rng: Pcg64::from_entropy(),
         }
     }
@@ -243,6 +249,27 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn serve_job(
+    member: Address,
+    job: JobParameters,
+    state: &mut FullDaoState,
+) -> anyhow::Result<()> {
+     let job_id: u64 = state.rng.gen();
+     state.outstanding_jobs.insert(member.node().to_string(), job_id.clone());
+     let seed = state.rng.gen_range(0..1_000_000);  // TODO
+     Request::to(member)
+         .body(serde_json::to_vec(&MemberRequest::ServeJob {
+             job_id,
+             seed,
+             workflow: job.workflow,
+             prompt: job.prompt,
+         })?)
+         .inherit(true)
+         .expects_response(60)  // TODO
+         .send()?;
+    Ok(())
+}
+
 fn handle_admin_request(
     our: &Address,
     message: &Message,
@@ -280,7 +307,7 @@ fn handle_public_request(
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
     match serde_json::from_slice(message.body())? {
-        PublicRequest::RunJob { workflow, prompt } => {
+        PublicRequest::RunJob(job) => {
             // permute is_ready providers & ping in until one Responds is_ready
             // TODO: improve algo
             let process_id = state.provider_process.clone().unwrap();
@@ -301,20 +328,8 @@ fn handle_public_request(
                         if !is_ready {
                             // TODO: reprimand fake ready member?
                         } else {
-                            let job_id: u64 = state.rng.gen();
-                            state.outstanding_jobs.insert(member.clone(), job_id.clone());
-                            let seed = state.rng.gen_range(0..1_000_000);
-                            Request::to(address)
-                                .body(serde_json::to_vec(&MemberRequest::ServeJob {
-                                    job_id,
-                                    seed,
-                                    workflow,
-                                    prompt,
-                                })?)
-                                .inherit(true)
-                                .expects_response(60)  // TODO
-                                .send()?;
-                            break;
+                            serve_job(address, job, state)?;
+                            return Ok(());
                         }
                     }
                     Err(e) => {
@@ -323,6 +338,12 @@ fn handle_public_request(
                 }
                 state.ready_providers.remove(&member);
             }
+            // no one available to serve job
+            // TODO: add stat trackers so we can expose endpoints:
+            //  * how long queue is
+            //  * average time / job
+            //    -> expected time till result
+            state.job_queue.push_back(job);
         }
     }
     Ok(())
@@ -343,7 +364,12 @@ fn handle_member_request(
     match serde_json::from_slice(message.body())? {
         MemberRequest::SetIsReady { is_ready } => {
             if is_ready {
-                state.ready_providers.insert(source.node().to_string());
+                if !state.job_queue.is_empty() {
+                    let job = state.job_queue.pop_front().unwrap();
+                    serve_job(source.clone(), job, state)?;
+                } else {
+                    state.ready_providers.insert(source.node().to_string());
+                }
             }
         }
         MemberRequest::QueryReady | MemberRequest::ServeJob { .. } => {
