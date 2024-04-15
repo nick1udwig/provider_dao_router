@@ -6,7 +6,7 @@ use rand::{Rng, SeedableRng, prelude::SliceRandom};
 use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
-use kinode_process_lib::{await_message, call_init, get_blob, get_typed_state, println, set_state, Address, LazyLoadBlob, Message, ProcessId, Request, Response};
+use kinode_process_lib::{await_message, call_init, get_blob, get_typed_state, println, set_state, Address, LazyLoadBlob, Message, ProcessId, Request, Response, SendError};
 
 wit_bindgen::generate!({
     path: "wit",
@@ -39,6 +39,7 @@ enum MemberRequest {
     SetIsReady { is_ready: bool },
     /// Router querying if member is ready to serve.
     QueryReady,
+    JobTaken { job_id: u64 },
     ServeJob { job_id: u64, seed: u32, workflow: String, prompt: String },
 }
 
@@ -47,6 +48,8 @@ enum MemberResponse {
     SetIsReady,
     /// Member Response to router: is_ready.
     QueryReady { is_ready: bool },
+    /// Ack
+    JobTaken,
     /// Job result.
     /// Signature in body; result in LazyLoadBlob.
     ServeJob { job_id: u64, signature: Result<u64, String> },  // ?
@@ -110,6 +113,7 @@ struct FullDaoState {
     ready_providers: HashSet<String>,
     outstanding_jobs: HashMap<String, u64>,
     job_queue: std::collections::VecDeque<JobParameters>,
+    job_queries: HashMap<u64, JobQuery>,
     rng: Pcg64,
     // TODO: payments
     // client_outstanding_payments: HashMap<String, u8>,
@@ -117,6 +121,13 @@ struct FullDaoState {
     // unpaid_receipts: HashMap<>,
     // pending_receipts: HashMap<>,
     // paid_receipts: Vec<HashMap<>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JobQuery {
+    job: JobParameters,
+    num_rejections: u32,
+    num_queried: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -172,6 +183,7 @@ impl Default for FullDaoState {
             ready_providers: HashSet::new(),
             outstanding_jobs: HashMap::new(),
             job_queue: std::collections::VecDeque::new(),
+            job_queries: HashMap::new(),
             rng: Pcg64::from_entropy(),
         }
     }
@@ -251,7 +263,7 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
 }
 
 fn serve_job(
-    member: Address,
+    member: &Address,
     job: JobParameters,
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
@@ -309,43 +321,33 @@ fn handle_public_request(
 ) -> anyhow::Result<()> {
     match serde_json::from_slice(message.body())? {
         PublicRequest::RunJob(job) => {
-            // permute is_ready providers & ping in until one Responds is_ready
+            if !state.job_queue.is_empty() {
+                // other jobs in queue -> add to back
+                state.job_queue.push_back(job);
+                println!("new job added to queue; now have {} queued", state.job_queue.len());
+                state.save()?;
+                return Ok(());
+            }
+            // permute is_ready providers & flood all with query if ready;
+            //  first gets job; if none ready, queue
             // TODO: improve algo
             let process_id = state.provider_process.clone().unwrap();
+            let job_id: u64 = state.rng.gen();
+            state.job_queries.insert(job_id, JobQuery {
+                job: job.clone(),
+                num_rejections: 0,
+                num_queried: state.ready_providers.len() as u32,
+            });
             for member in permute(state.ready_providers.iter().cloned().collect(), &mut state.rng) {
                 let address = Address::new(member.clone(), process_id.clone());
-                match Request::to(address.clone())
+                Request::to(address.clone())
                     .body(serde_json::to_vec(&MemberRequest::QueryReady)?)
-                    .send_and_await_response(  // TODO: can't await; this blocks and so is unsuitable for a router, which should never block; need to have a better algo here for querying ready / starting jobs
+                    .context(serde_json::to_vec(&job_id)?)
+                    .expects_response(
                         state.on_chain_state.queue_response_timeout_seconds as u64
-                    )?
-                {
-                    Ok(m) => {
-                        state.ready_providers.remove(&member);
-                        let MemberResponse::QueryReady { is_ready } = serde_json::from_slice(m.body())? else {
-                            // unexpected Response
-                            continue;
-                        };
-                        if !is_ready {
-                            // TODO: reprimand fake ready member?
-                        } else {
-                            serve_job(address, job, state)?;
-                            return Ok(());
-                        }
-                    }
-                    Err(e) => {
-                        // TODO: reprimand offline member?
-                    }
-                }
+                    )
+                    .send()?;
             }
-            // no one available to serve job
-            // TODO: add stat trackers so we can expose endpoints:
-            //  * how long queue is
-            //  * average time / job
-            //    -> expected time till result
-            state.job_queue.push_back(job);
-            println!("no ready providers; queued; now have {} queued", state.job_queue.len());
-            state.save()?;
         }
     }
     Ok(())
@@ -368,14 +370,14 @@ fn handle_member_request(
             if is_ready {
                 if !state.job_queue.is_empty() {
                     let job = state.job_queue.pop_front().unwrap();
-                    serve_job(source.clone(), job, state)?;
+                    serve_job(source, job, state)?;
                 } else {
                     state.ready_providers.insert(source.node().to_string());
                     state.save()?;
                 }
             }
         }
-        MemberRequest::QueryReady | MemberRequest::ServeJob { .. } => {
+        MemberRequest::QueryReady | MemberRequest::ServeJob { .. } | MemberRequest::JobTaken { .. } => {
             return Err(anyhow::anyhow!("unexpected MemberRequest"));
         }
     }
@@ -400,7 +402,38 @@ fn handle_member_response(
             state.outstanding_jobs.remove(message.source().node());
             state.save()?;
         }
-        MemberResponse::SetIsReady | MemberResponse::QueryReady { .. } => {
+        MemberResponse::QueryReady { is_ready } => {
+            // compare to handle_message() send_err case
+            let job_id: u64 = serde_json::from_slice(message.context().unwrap_or_default())?;
+            let Some(mut job_query) = state.job_queries.remove(&job_id) else {
+                Request::to(message.source())
+                    .body(serde_json::to_vec(&MemberRequest::JobTaken { job_id })?)
+                    .send()?;
+                state.save()?;
+                return Ok(());
+            };
+            if !is_ready {
+                // TODO: reprimand fake ready member?
+                job_query.num_rejections += 1;
+                if job_query.num_rejections >= job_query.num_queried {
+                    // no one available to serve job
+                    // TODO: add stat trackers so we can expose endpoints:
+                    //  * how long queue is
+                    //  * average time / job
+                    //    -> expected time till result
+                    state.job_queue.push_back(job_query.job);
+                    println!("no ready providers; now have {} queued", state.job_queue.len());
+                    state.save()?;
+                    return Ok(());
+                }
+                state.job_queries.insert(job_id, job_query);
+                state.save()?;
+                return Ok(());
+            }
+            serve_job(message.source(), job_query.job, state)?;
+        }
+        MemberResponse::JobTaken => {}
+        MemberResponse::SetIsReady => {
             return Err(anyhow::anyhow!("unexpected MemberResponse"));
         }
     }
@@ -420,7 +453,32 @@ fn handle_sequencer_response(state: &mut FullDaoState) -> anyhow::Result<()> {
 }
 
 fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()> {
-    let message = await_message()?;
+    let message = match await_message() {
+        Ok(m) => m,
+        Err(send_err) => {
+            // compare to handle_member_response() MemberResponse::QueryReady case
+            let job_id: u64 = serde_json::from_slice(send_err.context().unwrap_or_default())?;
+            let Some(mut job_query) = state.job_queries.remove(&job_id) else {
+                // provider is offline, so don't inform them
+                return Ok(());
+            };
+            job_query.num_rejections += 1;
+            if job_query.num_rejections >= job_query.num_queried {
+                // no one available to serve job
+                // TODO: add stat trackers so we can expose endpoints:
+                //  * how long queue is
+                //  * average time / job
+                //    -> expected time till result
+                state.job_queue.push_back(job_query.job);
+                println!("no ready providers; now have {} queued", state.job_queue.len());
+                state.save()?;
+                return Ok(());
+            }
+            state.job_queries.insert(job_id, job_query);
+            state.save()?;
+            return Ok(());
+        }
+    };
 
     if message.is_request() {
         if handle_admin_request(our, &message, state).is_ok() {
