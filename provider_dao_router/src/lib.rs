@@ -261,7 +261,7 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("fetch_chain_state didn't get back blob"));
     };
     let Ok(SequencerResponse::Read(ReadResponse::All(new_dao_state))) = serde_json::from_slice(bytes) else {
-        println!("{:?}", serde_json::from_slice::<serde_json::Value>(bytes));
+        //println!("{:?}", serde_json::from_slice::<serde_json::Value>(bytes));
         return Err(anyhow::anyhow!("fetch_chain_state got wrong Response back"));
     };
     state.on_chain_state = new_dao_state.clone();
@@ -290,7 +290,7 @@ fn serve_job(
              parameters: job.parameters,
          })?)
          .inherit(true)
-         .expects_response(60)  // TODO
+         .expects_response(5)  // TODO
          .send()?;
     state.save()?;
     Ok(())
@@ -427,23 +427,6 @@ fn handle_member_response(
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
     match serde_json::from_slice(message.body())? {
-        //MemberResponse::ServeJob { job_id, signature } => {
-            //if let Err(e) = signature {
-            //    return Err(anyhow::anyhow!("{}", e));
-            //}
-            //// give Response to client
-            //Response::new()
-            //    .body(serde_json::to_vec(&PublicResponse::RunJob(RunResponse::JobComplete))?)
-            //    .inherit(true)
-            //    .send()?;
-            //let Some((job_source, expected_job_id)) = state.outstanding_jobs.remove(message.source().node()) else {
-            //    return Err(anyhow::anyhow!("provider sent back {job_id} but no record here"));
-            //};
-            //if job_id != expected_job_id {
-            //    println!("job_id != expected_job_id: this should never occur! provider gave us wrong job back");
-            //}
-            //state.save()?;
-        //}
         MemberResponse::QueryReady { is_ready } => {
             // compare to handle_message() send_err case
             let (job_source, job_id): (Address, u64) = serde_json::from_slice(
@@ -500,6 +483,7 @@ fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()>
     let message = match await_message() {
         Ok(m) => m,
         Err(send_err) => {
+            //println!("SendError\nkind: {:?}\nbody: {:?}", send_err.kind(), serde_json::from_slice::<serde_json::Value>(send_err.message().body()));
             // compare to handle_member_response() MemberResponse::QueryReady case
             let (source, job_id): (Address, u64) = serde_json::from_slice(
                 send_err.context().unwrap_or_default()
