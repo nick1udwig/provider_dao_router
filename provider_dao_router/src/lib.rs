@@ -19,19 +19,14 @@ wit_bindgen::generate!({
 #[derive(Debug, Serialize, Deserialize)]
 enum PublicRequest {
     RunJob(JobParameters),
+    /// Parameters in LazyLoadBlob.
+    JobUpdate { job_id: u64, is_final: bool, signature: Result<u64, String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum PublicResponse {
-    RunJob(RunResponse)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum RunResponse {
-    /// Parameters in LazyLoadBlob.
-    JobComplete,
-    PaymentRequired,
-    Error(String),
+    RunJob(RunResponse),
+    JobUpdate,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,7 +35,10 @@ enum MemberRequest {
     /// Router querying if member is ready to serve.
     QueryReady,
     JobTaken { job_id: u64 },
-    ServeJob { job_id: u64, seed: u32, workflow: String, prompt: String },
+    ServeJob { job_id: u64, seed: u32, workflow: String, parameters: String },
+    ///// Job result.
+    ///// Signature in body; result in LazyLoadBlob.
+    JobUpdate { job_id: u64, is_final: bool, signature: Result<u64, String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,9 +48,11 @@ enum MemberResponse {
     QueryReady { is_ready: bool },
     /// Ack
     JobTaken,
-    /// Job result.
-    /// Signature in body; result in LazyLoadBlob.
-    ServeJob { job_id: u64, signature: Result<u64, String> },  // ?
+    //ServeJob { job_id: u64, signature: Result<u64, String> },  // ?
+    /// Ack
+    ServeJob,
+    /// Ack
+    JobUpdate,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,10 +79,17 @@ enum SequencerResponse {
     Write,  // TODO: return hash of tx?
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+enum RunResponse {
+    JobQueued { job_id: u64 },
+    PaymentRequired,
+    Error(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JobParameters {
     pub workflow: String,
-    pub prompt: String,
+    pub parameters: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,8 +118,8 @@ struct FullDaoState {
     rollup_sequencer: Option<Address>,
     on_chain_state: OnChainDaoState,
     ready_providers: HashSet<String>,
-    outstanding_jobs: HashMap<String, u64>,
-    job_queue: std::collections::VecDeque<JobParameters>,
+    outstanding_jobs: HashMap<String, (Address, u64)>,
+    job_queue: std::collections::VecDeque<(Address, u64, JobParameters)>,
     job_queries: HashMap<u64, JobQuery>,
     rng: Pcg64,
     // TODO: payments
@@ -223,24 +230,24 @@ fn permute<T>(mut vec: Vec<T>, rng: &mut Pcg64) -> Vec<T> {
     vec
 }
 
-//fn permute_and_chunk<T>(mut vec: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
-//    let mut rng = rand::thread_rng();
-//    vec.shuffle(&mut rng);
+// fn permute_and_chunk<T>(mut vec: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
+//     let mut rng = rand::thread_rng();
+//     vec.shuffle(&mut rng);
 //
-//    vec.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect()
-//}
+//     vec.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect()
+// }
 
-fn fetch_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
-    let Some(rollup_sequencer) = state.rollup_sequencer.clone() else {
-        return Err(anyhow::anyhow!("fetch_chain_state rollup_sequencer must be set before chain state can be fetched"));
-    };
-    Request::to(rollup_sequencer)  // TODO
-        .body(vec![])
-        .blob_bytes(serde_json::to_vec(&SequencerRequest::Read(ReadRequest::All))?)
-        .expects_response(5) // TODO
-        .send()?;
-    Ok(())
-}
+// fn fetch_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
+//     let Some(rollup_sequencer) = state.rollup_sequencer.clone() else {
+//         return Err(anyhow::anyhow!("fetch_chain_state rollup_sequencer must be set before chain state can be fetched"));
+//     };
+//     Request::to(rollup_sequencer)  // TODO
+//         .body(vec![])
+//         .blob_bytes(serde_json::to_vec(&SequencerRequest::Read(ReadRequest::All))?)
+//         .expects_response(5) // TODO
+//         .send()?;
+//     Ok(())
+// }
 
 fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
     let Some(rollup_sequencer) = state.rollup_sequencer.clone() else {
@@ -254,7 +261,7 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("fetch_chain_state didn't get back blob"));
     };
     let Ok(SequencerResponse::Read(ReadResponse::All(new_dao_state))) = serde_json::from_slice(bytes) else {
-        println!("{:?}", serde_json::from_slice::<serde_json::Value>(bytes));
+        //println!("{:?}", serde_json::from_slice::<serde_json::Value>(bytes));
         return Err(anyhow::anyhow!("fetch_chain_state got wrong Response back"));
     };
     state.on_chain_state = new_dao_state.clone();
@@ -264,21 +271,26 @@ fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
 
 fn serve_job(
     member: &Address,
+    job_source: &Address,
+    job_id: u64,
     job: JobParameters,
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
      let job_id: u64 = state.rng.gen();
-     state.outstanding_jobs.insert(member.node().to_string(), job_id.clone());
+     state.outstanding_jobs.insert(
+         member.node().to_string(),
+         (job_source.clone(), job_id.clone()),
+     );
      let seed = state.rng.gen_range(0..1_000_000);  // TODO
      Request::to(member)
          .body(serde_json::to_vec(&MemberRequest::ServeJob {
              job_id,
              seed,
              workflow: job.workflow,
-             prompt: job.prompt,
+             parameters: job.parameters,
          })?)
          .inherit(true)
-         .expects_response(60)  // TODO
+         .expects_response(5)  // TODO
          .send()?;
     state.save()?;
     Ok(())
@@ -321,9 +333,15 @@ fn handle_public_request(
 ) -> anyhow::Result<()> {
     match serde_json::from_slice(message.body())? {
         PublicRequest::RunJob(job) => {
+            let job_id: u64 = state.rng.gen();
+            Response::new()
+                .body(serde_json::to_vec(&PublicResponse::RunJob(RunResponse::JobQueued {
+                    job_id: job_id.clone(),
+                }))?)
+                .send()?;
             if !state.job_queue.is_empty() {
                 // other jobs in queue -> add to back
-                state.job_queue.push_back(job);
+                state.job_queue.push_back((message.source().clone(), job_id, job));
                 println!("new job added to queue; now have {} queued", state.job_queue.len());
                 state.save()?;
                 return Ok(());
@@ -332,7 +350,6 @@ fn handle_public_request(
             //  first gets job; if none ready, queue
             // TODO: improve algo
             let process_id = state.provider_process.clone().unwrap();
-            let job_id: u64 = state.rng.gen();
             state.job_queries.insert(job_id, JobQuery {
                 job: job.clone(),
                 num_rejections: 0,
@@ -342,12 +359,15 @@ fn handle_public_request(
                 let address = Address::new(member.clone(), process_id.clone());
                 Request::to(address.clone())
                     .body(serde_json::to_vec(&MemberRequest::QueryReady)?)
-                    .context(serde_json::to_vec(&job_id)?)
+                    .context(serde_json::to_vec(&(message.source().clone(), job_id))?)
                     .expects_response(
                         state.on_chain_state.queue_response_timeout_seconds as u64
                     )
                     .send()?;
             }
+        }
+        PublicRequest::JobUpdate { .. } => {
+            return Err(anyhow::anyhow!("unexpected PublicRequest"));
         }
     }
     Ok(())
@@ -369,12 +389,29 @@ fn handle_member_request(
         MemberRequest::SetIsReady { is_ready } => {
             if is_ready {
                 if !state.job_queue.is_empty() {
-                    let job = state.job_queue.pop_front().unwrap();
-                    serve_job(source, job, state)?;
+                    let (job_source, job_id, job) = state.job_queue.pop_front().unwrap();
+                    serve_job(source, &job_source, job_id, job, state)?;
                 } else {
                     state.ready_providers.insert(source.node().to_string());
                     state.save()?;
                 }
+            }
+        }
+        MemberRequest::JobUpdate { ref job_id, ref is_final, ref signature } => {
+            let Some((job_source, expected_job_id)) = state.outstanding_jobs.get(message.source().node()) else {
+                return Err(anyhow::anyhow!("provider sent back {job_id} but no record here"));
+            };
+            if job_id != expected_job_id {
+                println!("job_id != expected_job_id: this should never occur! provider gave us wrong job back");
+            }
+            Request::to(job_source)
+                .body(message.body())
+                .inherit(true)
+                .send()?;
+            // TODO: log sigs
+            if is_final == &true {
+                state.outstanding_jobs.remove(message.source().node());
+                state.save()?;
             }
         }
         MemberRequest::QueryReady | MemberRequest::ServeJob { .. } | MemberRequest::JobTaken { .. } => {
@@ -390,21 +427,11 @@ fn handle_member_response(
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
     match serde_json::from_slice(message.body())? {
-        MemberResponse::ServeJob { job_id, signature } => {
-            if let Err(e) = signature {
-                return Err(anyhow::anyhow!("{}", e));
-            }
-            // give Response to client
-            Response::new()
-                .body(serde_json::to_vec(&PublicResponse::RunJob(RunResponse::JobComplete))?)
-                .inherit(true)
-                .send()?;
-            state.outstanding_jobs.remove(message.source().node());
-            state.save()?;
-        }
         MemberResponse::QueryReady { is_ready } => {
             // compare to handle_message() send_err case
-            let job_id: u64 = serde_json::from_slice(message.context().unwrap_or_default())?;
+            let (job_source, job_id): (Address, u64) = serde_json::from_slice(
+                message.context().unwrap_or_default()
+            )?;
             let Some(mut job_query) = state.job_queries.remove(&job_id) else {
                 Request::to(message.source())
                     .body(serde_json::to_vec(&MemberRequest::JobTaken { job_id })?)
@@ -421,7 +448,7 @@ fn handle_member_response(
                     //  * how long queue is
                     //  * average time / job
                     //    -> expected time till result
-                    state.job_queue.push_back(job_query.job);
+                    state.job_queue.push_back((job_source, job_id.clone(), job_query.job));
                     println!("no ready providers; now have {} queued", state.job_queue.len());
                     state.save()?;
                     return Ok(());
@@ -430,10 +457,10 @@ fn handle_member_response(
                 state.save()?;
                 return Ok(());
             }
-            serve_job(message.source(), job_query.job, state)?;
+            serve_job(message.source(), &job_source, job_id, job_query.job, state)?;
         }
-        MemberResponse::JobTaken => {}
-        MemberResponse::SetIsReady => {
+        MemberResponse::JobTaken | MemberResponse::ServeJob => {}
+        MemberResponse::SetIsReady | MemberResponse::JobUpdate => {
             return Err(anyhow::anyhow!("unexpected MemberResponse"));
         }
     }
@@ -456,8 +483,11 @@ fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()>
     let message = match await_message() {
         Ok(m) => m,
         Err(send_err) => {
+            //println!("SendError\nkind: {:?}\nbody: {:?}", send_err.kind(), serde_json::from_slice::<serde_json::Value>(send_err.message().body()));
             // compare to handle_member_response() MemberResponse::QueryReady case
-            let job_id: u64 = serde_json::from_slice(send_err.context().unwrap_or_default())?;
+            let (source, job_id): (Address, u64) = serde_json::from_slice(
+                send_err.context().unwrap_or_default()
+            )?;
             let Some(mut job_query) = state.job_queries.remove(&job_id) else {
                 // provider is offline, so don't inform them
                 return Ok(());
@@ -469,7 +499,7 @@ fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()>
                 //  * how long queue is
                 //  * average time / job
                 //    -> expected time till result
-                state.job_queue.push_back(job_query.job);
+                state.job_queue.push_back((source, job_id, job_query.job));
                 println!("no ready providers; now have {} queued", state.job_queue.len());
                 state.save()?;
                 return Ok(());
