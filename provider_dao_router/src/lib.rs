@@ -278,7 +278,7 @@ fn serve_job(
          member.node().to_string(),
          (job_source.clone(), job_id.clone()),
      );
-     let seed = state.rng.gen_range(0..1_000_000);  // TODO
+     let seed = state.rng.gen_range(0..10_000_000);  // TODO
      Request::to(member)
          .body(serde_json::to_vec(&MemberRequest::ServeJob {
              job_id,
@@ -336,8 +336,8 @@ fn handle_public_request(
                     job_id: job_id.clone(),
                 }))?)
                 .send()?;
-            if !state.job_queue.is_empty() {
-                // other jobs in queue -> add to back
+            if state.ready_providers.is_empty() {
+                // no ready providers -> add to queue
                 state.job_queue.push_back((message.source().clone(), job_id, job));
                 println!("new job added to queue; now have {} queued", state.job_queue.len());
                 state.save()?;
@@ -384,7 +384,10 @@ fn handle_member_request(
     }
     match serde_json::from_slice(message.body())? {
         MemberRequest::SetIsReady { is_ready } => {
-            if is_ready {
+            if !is_ready {
+                state.ready_providers.remove(source.node());
+                state.save()?;
+            } else {
                 if !state.job_queue.is_empty() {
                     let (job_source, job_id, job) = state.job_queue.pop_front().unwrap();
                     serve_job(source, &job_source, job_id, job, state)?;
