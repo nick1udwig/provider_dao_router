@@ -1265,6 +1265,7 @@ name = "provider_dao_router"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "bincode",
  "kinode_process_lib",

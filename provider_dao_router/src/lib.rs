@@ -2,16 +2,54 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use alloy_primitives::Address as AlloyAddress;
+use alloy_sol_types::{sol, SolEvent};
 use rand::{Rng, SeedableRng, prelude::SliceRandom};
 use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
-use kinode_process_lib::{await_message, call_init, get_blob, get_typed_state, println, set_state, Address, LazyLoadBlob, Message, ProcessId, Request, Response, SendError};
+use kinode_process_lib::{await_message, call_init, get_blob, get_typed_state, println, set_state, eth, Address, LazyLoadBlob, Message, ProcessId, Request, Response, SendError};
 
 wit_bindgen::generate!({
     path: "wit",
     world: "process",
 });
+
+const CHAIN_ID: u64 = 10; // optimism
+const CONTRACT_ADDRESS: &str = "0xfoobar"; // optimism TODO
+const EVENTS: [&str; 8] = [
+    "DaoCreated(bytes32)",
+    "DaoDestroyed(bytes32)",
+    "MemberAdded(bytes32,address,bytes32,bool,bool)",
+    "MemberChanged(bytes32,address,bytes32,bool,bool,bool)",
+    "ParametersChanged(bytes32,uint256,uint256,uint256)",
+    "IsPermissionedChanged(bytes32,bool)",
+    "ProposalCreated(bytes32,uint256)",
+    "Voted(bytes32,address,uint256,bool)",
+];
+const SAVE_STATE_EVERY_N_BLOCKS: u64 = 1000;
+
+sol! {
+    event DaoCreated(bytes32 daoId);
+    event DaoDestroyed(bytes32 daoId);
+    event MemberAdded(bytes32 daoId, address member, bytes32 nodeId, bool isProvider, bool isRouter);
+    event MemberChanged(
+        bytes32 daoId,
+        address member,
+        bytes32 nodeId,
+        bool isMember,
+        bool isProvider,
+        bool isRouter
+    );
+    event ParametersChanged(
+        bytes32 daoId,
+        uint256 queueResponseTimeoutSeconds,
+        uint256 serveTimeoutSeconds,
+        uint256 maxOutstandingPayments
+    );
+    event IsPermissionedChanged(bytes32 daoId, bool isPermissioned);
+    event ProposalCreated(bytes32 daoId, uint256 proposalId);
+    event Voted(bytes32 daoId, address voter, uint256 proposalId, bool vote);
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum PublicRequest {
@@ -56,12 +94,18 @@ enum MemberResponse {
 enum AdminRequest {
     SetProviderProcess { process_id: String },
     SetRollupSequencer { address: String },
+    SetContractAddress { address: String },
+    CreateDao,
+    SetDaoId { dao_id: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum AdminResponse {
     SetProviderProcess { err: Option<String> },
     SetRollupSequencer { err: Option<String> },
+    SetContractAddress { err: Option<String> },
+    CreateDao { err: Option<String> },
+    SetDaoId { err: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +163,9 @@ struct FullDaoState {
     job_queue: std::collections::VecDeque<(Address, u64, JobParameters)>,
     job_queries: HashMap<u64, JobQuery>,
     rng: Pcg64,
+    contract_address: String,
+    last_saved_block: u64,
+    dao_id: Vec<u8>,
     // TODO: payments
     // client_outstanding_payments: HashMap<String, u8>,
     // alleged_receipts: HashMap<>,
@@ -144,7 +191,8 @@ struct OnChainDaoState {
     pub queue_response_timeout_seconds: u8,
     pub serve_timeout_seconds: u16, // TODO
     pub max_outstanding_payments: u8,
-    pub payment_period_hours: u8,
+    // pub payment_period_hours: u8,
+    pub is_permissioned: bool,
 }
 
 /// Possible proposals
@@ -189,6 +237,9 @@ impl Default for FullDaoState {
             job_queue: std::collections::VecDeque::new(),
             job_queries: HashMap::new(),
             rng: Pcg64::from_entropy(),
+            contract_address: CONTRACT_ADDRESS.to_string(),
+            last_saved_block: 0,
+            dao_id: vec![],
         }
     }
 }
@@ -200,10 +251,11 @@ impl Default for OnChainDaoState {
             routers: vec![],
             members: HashMap::new(),
             proposals: HashMap::new(),
-            queue_response_timeout_seconds: 0,
-            serve_timeout_seconds: 0,
-            max_outstanding_payments: 0,
-            payment_period_hours: 0,
+            queue_response_timeout_seconds: 1,  // NOTE: default
+            serve_timeout_seconds: 60,          // NOTE: default
+            max_outstanding_payments: 3,        // NOTE: default
+            //payment_period_hours: 0,
+            is_permissioned: true,
         }
     }
 }
@@ -219,6 +271,116 @@ impl FullDaoState {
             Some(rs) => rs,
             None => FullDaoState::default(),
         }
+    }
+
+    fn ingest_listings_contract_event(
+        &mut self,
+        our: &Address,
+        log: eth::Log,
+    ) -> anyhow::Result<()> {
+        match log.topics[0] {
+            DaoCreated::SIGNATURE_HASH => {
+                let dao_id = DaoCreated::abi_decode_data(&log.data, true)?.0.to_vec();
+                if dao_id == self.dao_id {
+                    println!("got dao creation event");
+                }
+            }
+            DaoDestroyed::SIGNATURE_HASH => {
+                let dao_id = DaoDestroyed::abi_decode_data(&log.data, true)?.0.to_vec();
+                if dao_id != self.dao_id {
+                    return Ok(());
+                }
+                println!("got dao destruction event");
+                self.on_chain_state = OnChainDaoState::default();
+                self.dao_id = vec![];
+            }
+            MemberAdded::SIGNATURE_HASH => {
+                let (dao_id, member, node_id, is_provider, is_router) = MemberAdded::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                let node_id = node_id.to_vec();
+                let node = String::from_utf8(node_id)?;
+                if is_provider {
+                    self.on_chain_state.members.insert(node.clone(), member);
+                }
+                if is_router {
+                    self.on_chain_state.routers.push(node);
+                }
+                self.on_chain_state.queue_response_timeout_seconds = 1;  // NOTE: hardcode
+                self.on_chain_state.serve_timeout_seconds = 60;          // NOTE: hardcode
+                self.on_chain_state.max_outstanding_payments = 3;        // NOTE: hardcode
+            }
+            MemberChanged::SIGNATURE_HASH => {
+                let (dao_id, member, node_id, is_member, is_provider, is_router) = MemberChanged::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                let node_id = node_id.to_vec();
+                let node = String::from_utf8(node_id)?;
+                if !is_member {
+                    self.on_chain_state.members.remove(&node);
+                    if let Some(pos) = self.on_chain_state.routers.iter().position(|s| s == &node) {
+                        self.on_chain_state.routers.remove(pos);
+                    }
+                    return Ok(());
+                }
+                if is_provider {
+                    self.on_chain_state.members.insert(node.clone(), member);
+                } else {
+                    self.on_chain_state.members.remove(&node);
+                }
+                if is_router {
+                    if !self.on_chain_state.routers.contains(&node) {
+                        self.on_chain_state.routers.push(node);
+                    }
+                } else {
+                    if let Some(pos) = self.on_chain_state.routers.iter().position(|s| s == &node) {
+                        self.on_chain_state.routers.remove(pos);
+                    }
+                }
+            }
+            ParametersChanged::SIGNATURE_HASH => {
+                let (dao_id, queue_response_timeout_seconds, serve_timeout_seconds, max_outstanding_payments) = ParametersChanged::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                self.on_chain_state.queue_response_timeout_seconds = u8::try_from(queue_response_timeout_seconds)?;
+                self.on_chain_state.serve_timeout_seconds = u16::try_from(serve_timeout_seconds)?;
+                self.on_chain_state.max_outstanding_payments = u8::try_from(max_outstanding_payments)?;
+            }
+            IsPermissionedChanged::SIGNATURE_HASH => {
+                let (dao_id, is_permissioned) = IsPermissionedChanged::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                self.on_chain_state.is_permissioned = is_permissioned;
+            }
+            ProposalCreated::SIGNATURE_HASH => {
+                let (dao_id, proposal_id) = ProposalCreated::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                // TODO
+            }
+            Voted::SIGNATURE_HASH => {
+                let (dao_id, voter, proposal_id, vote) = Voted::abi_decode_data(&log.data, true)?;
+                if dao_id.to_vec() != self.dao_id {
+                    return Ok(());
+                }
+                // TODO
+            }
+            _ => {}
+        }
+        let block_number: u64 = log
+            .block_number
+            .ok_or(anyhow::anyhow!("got log with no block number"))?
+            .try_into()?;
+        if block_number > self.last_saved_block + SAVE_STATE_EVERY_N_BLOCKS {
+            self.last_saved_block = block_number;
+            self.save()?;
+        }
+        Ok(())
     }
 }
 
@@ -245,6 +407,32 @@ fn permute<T>(mut vec: Vec<T>, rng: &mut Pcg64) -> Vec<T> {
 //         .send()?;
 //     Ok(())
 // }
+
+fn fetch_logs(eth_provider: &eth::Provider, filter: &eth::Filter) -> Vec<eth::Log> {
+    loop {
+        match eth_provider.get_logs(filter) {
+            Ok(res) => return res,
+            Err(_) => {
+                println!("failed to fetch logs! trying again in 5s...");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+        }
+    }
+}
+
+fn subscribe_to_logs(eth_provider: &eth::Provider, filter: &eth::Filter) {
+    loop {
+        match eth_provider.subscribe(1, filter.clone()) {
+            Ok(()) => break,
+            Err(_) => {
+                println!("failed to subscribe to chain! trying again in 5s...");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+        }
+    }
+}
 
 fn await_chain_state(state: &mut FullDaoState) -> anyhow::Result<()> {
     let Some(rollup_sequencer) = state.rollup_sequencer.clone() else {
@@ -296,6 +484,8 @@ fn serve_job(
 fn handle_admin_request(
     our: &Address,
     message: &Message,
+    eth_provider: &eth::Provider,
+    filter: &eth::Filter,
     state: &mut FullDaoState,
 ) -> anyhow::Result<()> {
     let source = message.source();
@@ -317,6 +507,28 @@ fn handle_admin_request(
             await_chain_state(state)?;
             Response::new()
                 .body(serde_json::to_vec(&AdminResponse::SetRollupSequencer { err: None })?)
+                .send()?;
+        }
+        AdminRequest::SetContractAddress { address } => {
+            state.contract_address = address;
+            Response::new()
+                .body(serde_json::to_vec(&AdminResponse::SetContractAddress { err: None })?)
+                .send()?;
+        }
+        AdminRequest::CreateDao => {
+            // TODO:
+            // this belong on the FE, along with all other DAO-changing requests
+            // so we can take advantage of already-existing wallet software
+            //init_eth(our, eth_provider, filter, state).unwrap();
+            //Response::new()
+            //    .body(serde_json::to_vec(&AdminResponse::CreateDao { err: None })?)
+            //    .send()?;
+        }
+        AdminRequest::SetDaoId { dao_id } => {
+            state.dao_id = dao_id;
+            init_eth(our, eth_provider, filter, state).unwrap();
+            Response::new()
+                .body(serde_json::to_vec(&AdminResponse::SetDaoId { err: None })?)
                 .send()?;
         }
     }
@@ -421,6 +633,40 @@ fn handle_member_request(
     Ok(())
 }
 
+fn handle_eth_sub(
+    our: &Address,
+    message: &Message,
+    eth_provider: &eth::Provider,
+    state: &mut FullDaoState,
+) -> anyhow::Result<()> {
+    let eth_sub_result = serde_json::from_slice::<eth::EthSubResult>(message.body())?;
+    if message.source().node() != our.node() || message.source().process != "eth:distro:sys" {
+        return Err(anyhow::anyhow!("eth sub event from weird addr: {}", message.source()));
+    }
+    match eth_sub_result {
+        Ok(event) => {
+            // handle eth sub event
+            let eth::SubscriptionResult::Log(log) = event.result else {
+                return Err(anyhow::anyhow!("got non-log event"));
+            };
+            state.ingest_listings_contract_event(our, *log)?;
+        }
+        Err(_e) => {
+            println!("got eth subscription error");
+            // attempt to resubscribe
+            subscribe_to_logs(
+                eth_provider,
+                &eth::Filter::new()
+                    .address(eth::Address::from_str(&state.contract_address).unwrap())
+                    .from_block(state.last_saved_block - 1)
+                    .to_block(eth::BlockNumberOrTag::Latest)
+                    .events(EVENTS),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn handle_member_response(
     our: &Address,
     message: &Message,
@@ -479,7 +725,12 @@ fn handle_sequencer_response(state: &mut FullDaoState) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()> {
+fn handle_message(
+    our: &Address,
+    state: &mut FullDaoState,
+    eth_provider: &eth::Provider,
+    filter: &eth::Filter,
+) -> anyhow::Result<()> {
     let message = match await_message() {
         Ok(m) => m,
         Err(send_err) => {
@@ -511,7 +762,10 @@ fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()>
     };
 
     if message.is_request() {
-        if handle_admin_request(our, &message, state).is_ok() {
+        if handle_admin_request(our, &message, eth_provider, filter, state).is_ok() {
+            return Ok(());
+        }
+        if handle_eth_sub(our, &message, eth_provider, state).is_ok() {
             return Ok(());
         }
         if state.provider_process.is_none() {
@@ -538,14 +792,45 @@ fn handle_message(our: &Address, state: &mut FullDaoState) -> anyhow::Result<()>
     Ok(())
 }
 
+fn init_eth(
+    our: &Address,
+    eth_provider: &eth::Provider,
+    filter: &eth::Filter,
+    state: &mut FullDaoState,
+) -> anyhow::Result<()> {
+    for log in fetch_logs(&eth_provider, &filter) {
+        if let Err(e) = state.ingest_listings_contract_event(our, log) {
+            println!("error ingesting log: {e:?}");
+        };
+    }
+    subscribe_to_logs(&eth_provider, filter);
+    Ok(())
+}
+
 call_init!(init);
 fn init(our: Address) {
     println!("begin");
 
     let mut state = FullDaoState::load();
+    println!("contract_address, dao_id: {}, {:?}", state.contract_address, state.dao_id);
+
+    // create new provider for sepolia with request-timeout of 60s
+    // can change, log requests can take quite a long time.
+    let eth_provider = eth::Provider::new(CHAIN_ID, 60);
+
+    // get past logs, subscribe to new ones.
+    let filter = eth::Filter::new()
+        .address(eth::Address::from_str(&state.contract_address).unwrap())
+        .from_block(state.last_saved_block - 1)
+        .to_block(eth::BlockNumberOrTag::Latest)
+        .events(EVENTS);
+
+    if !state.dao_id.is_empty() {
+        init_eth(&our, &eth_provider, &filter, &mut state).unwrap();
+    }
 
     loop {
-        match handle_message(&our, &mut state) {
+        match handle_message(&our, &mut state, &eth_provider, &filter) {
             Ok(()) => {},
             Err(e) => println!("{}: error: {:?}", our.process(), e),
         };

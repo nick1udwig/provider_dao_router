@@ -13,12 +13,18 @@ wit_bindgen::generate!({
 enum AdminRequest {
     SetProviderProcess { process_id: String },
     SetRollupSequencer { address: String },
+    SetContractAddress { address: String },
+    CreateDao,
+    SetDaoId { dao_id: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum AdminResponse {
     SetProviderProcess { err: Option<String> },
     SetRollupSequencer { err: Option<String> },
+    SetContractAddress { err: Option<String> },
+    CreateDao { err: Option<String> },
+    SetDaoId { err: Option<String> },
 }
 
 const PUBLISHER: &str = "nick1udwig.os";
